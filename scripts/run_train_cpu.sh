@@ -19,5 +19,4 @@ python ./cpu_train.py \
     --warmup_ratio=0.01 \
     --div_factor=10 \
     --final_div_factor=10 \
-    --log_every_n=100 \
-    --should_validate=false
+    --log_every_n=100

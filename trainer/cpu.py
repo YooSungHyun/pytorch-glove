@@ -138,8 +138,8 @@ class Trainer(metaclass=ABCMeta):
                 limit_batches=self.limit_train_batches,
             )
 
-            if self.should_validate:
-                self.eval_loop(state["model"], val_loader, limit_batches=self.limit_val_batches)
+            # if self.should_validate:
+            # self.eval_loop(state["model"], val_loader, limit_batches=self.limit_val_batches)
 
             self.step_scheduler(state["scheduler_cfg"], level="epoch", current_value=self.current_epoch)
 

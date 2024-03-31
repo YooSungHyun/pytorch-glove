@@ -37,4 +37,3 @@ class TrainingArguments:
     model_dtype: str = "fp32"
     negative_sample_n: int = 10
     window_size: int = 2
-    should_validate: bool = True
