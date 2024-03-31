@@ -4,29 +4,28 @@ import os
 from logging import StreamHandler
 from typing import Optional, Union
 
+import json
 import numpy as np
-import pandas as pd
 import torch
 import wandb
 from arguments.training_args import TrainingArguments
-from networks.models import Net
+from networks.models import GloVeModel
 from setproctitle import setproctitle
 from simple_parsing import ArgumentParser
-from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import RandomSampler, SequentialSampler, random_split
 from trainer.cpu import Trainer
 from utils.comfy import (
     apply_to_collection,
     dataclass_to_namespace,
-    json_to_dict,
     seed_everything,
     tensor_dict_to_device,
-    update_auto_nested_dict,
     web_log_every_n,
 )
 from utils.data.custom_dataloader import CustomDataLoader
 from utils.data.custom_sampler import LengthGroupedSampler
-from utils.data.np_dataset import NumpyDataset
+from utils.data.nlp_dataset import CBOWDataset
+import random
+from collections import defaultdict, deque
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -88,11 +87,9 @@ class CPUTrainer(Trainer):
             batch_idx: index of the current batch w.r.t the current epoch
 
         """
-        # TODO(User): fit the input and output for your model architecture!
-        labels = batch.pop("labels")
-
-        outputs = model(**batch)
-        loss = self.criterion(outputs, labels)
+        labels = batch.pop("prob")
+        focal_embed, context_embed, focal_bias, context_bias = model(**batch)
+        loss = self.criterion(focal_embed, context_embed, focal_bias, context_bias, labels)
 
         def on_before_backward(loss):
             pass
@@ -122,104 +119,6 @@ class CPUTrainer(Trainer):
         )
         return loss
 
-    def eval_loop(
-        self,
-        model,
-        val_loader: Optional[torch.utils.data.DataLoader],
-        limit_batches: Union[int, float] = float("inf"),
-    ):
-        """The validation loop ruunning a single validation epoch.
-
-        Args:
-            model: model
-            val_loader: The dataloader yielding the validation batches.
-            limit_batches: Limits the batches during this validation epoch.
-                If greater than the number of batches in the ``val_loader``, this has no effect.
-
-        """
-        # no validation if val_loader wasn't passed
-        if val_loader is None:
-            return
-
-        def on_start_eval(model):
-            model.eval()
-            # requires_grad = True, but loss.backward() raised error
-            # because grad_fn is None
-            torch.set_grad_enabled(False)
-
-        on_start_eval(model)
-
-        def on_validation_epoch_start():
-            pass
-
-        iterable = self.progbar_wrapper(val_loader, total=min(len(val_loader), limit_batches), desc="Validation")
-        eval_step = 0
-        tot_batch_logits = list()
-        tot_batch_labels = list()
-        for batch_idx, batch in enumerate(iterable):
-            tensor_dict_to_device(batch, "cpu", non_blocking=self.non_blocking)
-            # end epoch if stopping training completely or max batches for this epoch reached
-            if self.should_stop or batch_idx >= limit_batches:
-                break
-
-            def on_validation_batch_start(batch, batch_idx):
-                pass
-
-            on_validation_batch_start(batch, batch_idx)
-
-            # TODO(User): fit the input and output for your model architecture!
-            label = batch.pop("labels")
-
-            output = model(**batch)
-
-            loss = self.criterion(output, label)
-
-            # TODO(User): what do you want to log items every epoch end?
-            tot_batch_logits.append(output)
-            tot_batch_labels.append(label)
-
-            log_output = {"loss": loss}
-            # avoid gradients in stored/accumulated values -> prevents potential OOM
-            self._current_val_return = apply_to_collection(log_output, torch.Tensor, lambda x: x.detach())
-
-            def on_validation_batch_end(eval_out, batch, batch_idx):
-                pass
-
-            on_validation_batch_end(output, batch, batch_idx)
-
-            web_log_every_n(
-                self.web_logger,
-                {
-                    "eval_step/loss": self._current_val_return["loss"],
-                    "eval_step/step": eval_step,
-                    "eval_step/global_step": self.global_step,
-                    "eval_step/epoch": self.current_epoch,
-                },
-                eval_step,
-                self.log_every_n,
-            )
-            self._format_iterable(iterable, self._current_val_return, "val")
-            eval_step += 1
-
-        # TODO(User): Create any form you want to output to wandb!
-        def on_validation_epoch_end(tot_batch_logits, tot_batch_labels):
-            tot_batch_logits = torch.cat(tot_batch_logits, dim=0)
-            tot_batch_labels = torch.cat(tot_batch_labels, dim=0)
-            epoch_loss = self.criterion(tot_batch_logits, tot_batch_labels)
-            epoch_rmse = torch.sqrt(epoch_loss)
-            # epoch monitoring is must doing every epoch
-            web_log_every_n(
-                self.web_logger, {"eval/loss": epoch_rmse, "eval/epoch": self.current_epoch}, self.current_epoch, 1
-            )
-
-        on_validation_epoch_end(tot_batch_logits, tot_batch_labels)
-
-        def on_validation_model_train(model):
-            torch.set_grad_enabled(True)
-            model.train()
-
-        on_validation_model_train(model)
-
 
 def main(hparams: TrainingArguments):
     # reference: https://www.kaggle.com/code/anitarostami/lstm-multivariate-forecasting
@@ -227,81 +126,18 @@ def main(hparams: TrainingArguments):
     web_logger = wandb.init(config=hparams)
     seed_everything(hparams.seed)
 
-    df_train = pd.read_csv(hparams.train_datasets_path, header=0, encoding="utf-8")
-    # Kaggle author Test Final RMSE: 0.06539
-    df_eval = pd.read_csv(hparams.eval_datasets_path, header=0, encoding="utf-8")
+    train_dataset = np.loadtxt("./raw_data/train_comat.npy", dtype=np.float32)
+    eval_dataset = np.loadtxt("./raw_data/eval_comat.npy", dtype=np.float32)
+    logger.info(train_dataset)
 
-    df_train_scaled = df_train.copy()
-    df_test_scaled = df_eval.copy()
+    with open("raw_data/glove_vocab.json", "r") as st_json:
+        tokenizer = json.load(st_json)
 
-    # Define the mapping dictionary
-    mapping = {"NE": 0, "SE": 1, "NW": 2, "cv": 3}
-
-    # Replace the string values with numerical values
-    df_train_scaled["wnd_dir"] = df_train_scaled["wnd_dir"].map(mapping)
-    df_test_scaled["wnd_dir"] = df_test_scaled["wnd_dir"].map(mapping)
-
-    df_train_scaled["date"] = pd.to_datetime(df_train_scaled["date"])
-    # Resetting the index
-    df_train_scaled.set_index("date", inplace=True)
-    logger.info(df_train_scaled.head())
-
-    scaler = MinMaxScaler()
-
-    # Define the columns to scale
-    columns = ["pollution", "dew", "temp", "press", "wnd_dir", "wnd_spd", "snow", "rain"]
-
-    df_test_scaled = df_test_scaled[columns]
-
-    # Scale the selected columns to the range 0-1
-    df_train_scaled[columns] = scaler.fit_transform(df_train_scaled[columns])
-    df_test_scaled[columns] = scaler.transform(df_test_scaled[columns])
-
-    # Show the scaled data
-    logger.info(df_train_scaled.head())
-
-    df_train_scaled = np.array(df_train_scaled)
-    df_test_scaled = np.array(df_test_scaled)
-
-    x = []
-    y = []
-    n_future = 1
-    n_past = 11
-
-    #  Train Sets
-    for i in range(n_past, len(df_train_scaled) - n_future + 1):
-        x.append(df_train_scaled[i - n_past : i, 1 : df_train_scaled.shape[1]])
-        y.append(df_train_scaled[i + n_future - 1 : i + n_future, 0])
-    x_train, y_train = np.array(x), np.array(y)
-
-    #  Test Sets
-    x = []
-    y = []
-    for i in range(n_past, len(df_test_scaled) - n_future + 1):
-        x.append(df_test_scaled[i - n_past : i, 1 : df_test_scaled.shape[1]])
-        y.append(df_test_scaled[i + n_future - 1 : i + n_future, 0])
-    x_test, y_test = np.array(x), np.array(y)
-
-    logger.info(
-        "X_train shape : {}   y_train shape : {} \n"
-        "X_test shape : {}      y_test shape : {} ".format(x_train.shape, y_train.shape, x_test.shape, y_test.shape)
-    )
-
-    train_dataset = NumpyDataset(
-        x_train,
-        y_train,
-        feature_column_name=hparams.feature_column_name,
-        labels_column_name=hparams.labels_column_name,
-    )
-    eval_dataset = NumpyDataset(
-        x_test,
-        y_test,
-        feature_column_name=hparams.feature_column_name,
-        labels_column_name=hparams.labels_column_name,
-    )
+    train_dataset = CBOWDataset(train_dataset, tokenizer)
+    eval_dataset = CBOWDataset(eval_dataset, tokenizer)
 
     # Instantiate objects
-    model = Net()
+    model = GloVeModel(vocab_size=len(tokenizer.keys()), embedding_size=512)
     web_logger.watch(model, log_freq=hparams.log_every_n)
 
     optimizer = torch.optim.AdamW(
@@ -313,32 +149,12 @@ def main(hparams: TrainingArguments):
     )
 
     generator = None
-    if hparams.sampler_shuffle:
-        generator = torch.Generator()
-        generator.manual_seed(hparams.seed)
-    if hparams.group_by_length:
-        custom_train_sampler = LengthGroupedSampler(
-            batch_size=hparams.per_device_train_batch_size,
-            dataset=train_dataset,
-            model_input_name=train_dataset.length_column_name,
-            generator=generator,
-        )
-        custom_eval_sampler = LengthGroupedSampler(
-            batch_size=hparams.per_device_eval_batch_size,
-            dataset=eval_dataset,
-            model_input_name=eval_dataset.length_column_name,
-        )
-    else:
-        # custom_train_sampler = SequentialSampler(train_dataset)
-        custom_eval_sampler = SequentialSampler(eval_dataset)
-        custom_train_sampler = RandomSampler(train_dataset, generator=generator)
-        # custom_eval_sampler = RandomSampler(eval_dataset, generator=generator)
+    custom_train_sampler = RandomSampler(train_dataset, generator=generator)
+    custom_eval_sampler = SequentialSampler(eval_dataset)
 
     # If 1 device for training, sampler suffle True and dataloader shuffle True is same meaning
     train_dataloader = CustomDataLoader(
         dataset=train_dataset,
-        feature_column_name=hparams.feature_column_name,
-        labels_column_name=hparams.labels_column_name,
         batch_size=hparams.per_device_train_batch_size,
         sampler=custom_train_sampler,
         num_workers=hparams.num_workers,
@@ -347,8 +163,6 @@ def main(hparams: TrainingArguments):
 
     eval_dataloader = CustomDataLoader(
         dataset=eval_dataset,
-        feature_column_name=hparams.feature_column_name,
-        labels_column_name=hparams.labels_column_name,
         batch_size=hparams.per_device_eval_batch_size,
         sampler=custom_eval_sampler,
         num_workers=hparams.num_workers,
@@ -371,7 +185,7 @@ def main(hparams: TrainingArguments):
     # monitor: ReduceLROnPlateau scheduler is stepped using loss, so monitor input train or val loss
     lr_scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1, "monitor": None}
     assert id(scheduler) == id(lr_scheduler["scheduler"])
-    criterion = torch.nn.MSELoss()
+    criterion = model._loss
     trainable_loss = None
 
     # I think some addr is same into trainer init&fit respectfully
