@@ -11,14 +11,14 @@ class CustomDataLoader(torch.utils.data.DataLoader):
         # make pad or something work for each step's batch
         center = list()
         k = list()
-        prob = list()
+        cooccur_counts = list()
 
         for i in range(len(batch)):
             center.append(torch.tensor(batch[i]["i"]))
             k.append(torch.tensor(batch[i]["k"]))
-            prob.append(torch.tensor(batch[i]["prob"]))
+            cooccur_counts.append(torch.tensor(batch[i]["cooccur_counts"]))
 
-        _returns = {"center": torch.stack(center), "k": torch.stack(k), "prob": torch.stack(prob)}
+        _returns = {"center": torch.stack(center), "k": torch.stack(k), "cooccur_counts": torch.stack(cooccur_counts)}
         # _returns = {"input_ids", "attention_mask", "input_type_ids", "labels"}
 
         return _returns

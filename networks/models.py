@@ -20,13 +20,13 @@ class GloVeModel(nn.Module):
         self._focal_biases = nn.Embedding(vocab_size, 1)
         self._context_biases = nn.Embedding(vocab_size, 1)
 
-    def _loss(self, focal_embed, context_embed, focal_bias, context_bias, prob):
+    def _loss(self, focal_embed, context_embed, focal_bias, context_bias, cooccur_counts):
         # count weight factor
-        weight_factor = torch.pow(prob / self.x_max, self.alpha)
+        weight_factor = torch.pow(cooccur_counts / self.x_max, self.alpha)
         weight_factor[weight_factor > 1] = 1
 
         embedding_products = torch.sum(focal_embed * context_embed, dim=1)
-        log_cooccurrences = torch.log(prob)
+        log_cooccurrences = torch.log(cooccur_counts)
 
         distance_expr = (embedding_products + focal_bias.squeeze() + context_bias.squeeze() - log_cooccurrences) ** 2
 

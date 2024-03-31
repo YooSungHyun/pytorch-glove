@@ -14,7 +14,7 @@ class CBOWDataset(CustomDataset):
         non_zero_indices = np.argwhere(self.tot_comat != 0)
         self.raw_data = list()
         for row, col in non_zero_indices:
-            self.raw_data.append({"i": row, "k": col, "prob": tot_comat[row][col]})
+            self.raw_data.append({"i": row, "k": col, "cooccur_counts": tot_comat[row][col]})
         self.transform = transform
 
     def __len__(self):

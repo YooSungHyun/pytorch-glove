@@ -101,11 +101,6 @@ def calculate_cooccurrence_matrix(corpus, vocab, window_size=2):
                         cooccurrence_matrix[word_idx, context_word_idx] += 1.0
                         cooccurrence_matrix[context_word_idx, word_idx] += 1.0
 
-    # 동시등장 횟수를 확률로 변환
-    cooccurrence_sum = np.sum(cooccurrence_matrix, axis=1, keepdims=True)
-    cooccurrence_sum[cooccurrence_sum == 0] = 1  # 분모가 0인 경우를 1로 설정하여 나눗셈 오류 방지
-    cooccurrence_matrix /= cooccurrence_sum
-
     return cooccurrence_matrix
 
 
